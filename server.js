@@ -4,14 +4,30 @@ rateLimit=require("express-rate-limit"),fs=require("fs"),path=require("path"),cr
 const {JWT_SECRET,ADMIN_EMAIL,ADMIN_PASSWORD,PORT=3000}=process.env;
 if(!JWT_SECRET||!ADMIN_EMAIL||!ADMIN_PASSWORD)throw new Error("Set JWT_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD (in .env locally, or Render's Environment tab)");
 
-/* ---------- database: pure Node.js JSON file (no native modules) ---------- */
-const DB_PATH=process.env.DB_PATH||path.join(__dirname,"academy.json");
+/* ---------- database: JSON document, kept in Postgres (DATABASE_URL) and/or a file (DB_PATH) ---------- */
+const DB_PATH=process.env.DB_PATH||path.join(__dirname,"academy.json"),BAK=DB_PATH+".bak";
 fs.mkdirSync(path.dirname(path.resolve(DB_PATH)),{recursive:true});
-let data={admins:[],students:[],nextId:1};
-try{data=JSON.parse(fs.readFileSync(DB_PATH,"utf8"))}catch(e){if(e.code!=="ENOENT")throw e}
-// atomic write: write temp file, then rename, so a crash never corrupts the database
-const persist=()=>{const t=DB_PATH+".tmp";fs.writeFileSync(t,JSON.stringify(data));fs.renameSync(t,DB_PATH)};
-if(!data.admins.length){data.admins.push({email:ADMIN_EMAIL.toLowerCase(),password_hash:bcrypt.hashSync(ADMIN_PASSWORD,10)});persist()}
+let data=null,pool=null,chain=Promise.resolve();
+if(process.env.DATABASE_URL){const{Pool}=require("pg");pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.PGSSL==="off"?false:{rejectUnauthorized:false}})}
+const valid=d=>d&&Array.isArray(d.students)&&Array.isArray(d.admins);
+const readFile=f=>{try{const t=fs.readFileSync(f,"utf8").trim();if(!t)return null;const d=JSON.parse(t);return valid(d)?d:null}
+ catch(e){if(e.code!=="ENOENT")console.warn("Could not read "+f+": "+e.message);return null}};
+// Every save: atomic write to the main file, then a second copy (.bak); also mirrored to Postgres if configured.
+const persist=()=>{
+ try{const t=DB_PATH+".tmp";fs.writeFileSync(t,JSON.stringify(data));fs.renameSync(t,DB_PATH);fs.copyFileSync(DB_PATH,BAK)}catch(e){console.error("File save failed:",e.message)}
+ if(pool){const snap=JSON.stringify(data);chain=chain.then(()=>pool.query("INSERT INTO kv(k,v) VALUES('db',$1) ON CONFLICT(k) DO UPDATE SET v=$1,updated=now()",[snap])).catch(e=>console.error("Postgres save failed:",e.message))}};
+// Startup NEVER wipes existing data: Postgres → main file → backup file → (only then) a brand-new empty database.
+async function initDb(){
+ if(pool){await pool.query("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY,v JSONB NOT NULL,updated TIMESTAMPTZ DEFAULT now())");
+  const r=await pool.query("SELECT v FROM kv WHERE k='db'");   // if this throws we stop, rather than start empty and overwrite
+  if(r.rows[0]&&valid(r.rows[0].v)){data=r.rows[0].v;console.log("Loaded database from Postgres:",data.students.length,"students")}}
+ if(!data){data=readFile(DB_PATH);if(data)console.log("Loaded",DB_PATH,"-",data.students.length,"students")}
+ if(!data){data=readFile(BAK);if(data)console.warn("Main database missing/empty/corrupt - RESTORED from backup:",data.students.length,"students")}
+ if(!data){data={admins:[],students:[],nextId:1};console.log("No existing database found - starting a new one")}
+ data.nextId=Math.max(data.nextId||1,...data.students.map(s=>s.id+1));
+ if(!data.admins.length)data.admins.push({email:ADMIN_EMAIL.toLowerCase(),password_hash:bcrypt.hashSync(ADMIN_PASSWORD,10)});
+ persist();
+ if(!pool&&process.env.RENDER)console.warn("WARNING: running on Render without DATABASE_URL - files are wiped on redeploy unless DB_PATH is on a Persistent Disk.")}
 
 const get=id=>data.students.find(s=>s.id===+id);
 const dto=(s,admin)=>({id:s.id,name:s.name,parent:s.parent,course:s.course,active:s.active,fee:s.fee,cc:s.cc,li:s.li,
@@ -26,7 +42,7 @@ const auth=role=>(q,r,n)=>{try{
  if(role==="parent"){const s=get(t.sid);if(!s||!s.active)return r.status(403).json({error:"Access revoked. Please contact the academy."});q.st=s}
  n()}catch{r.status(401).json({error:"Please log in again"})}};
 const A=auth("admin"),P=auth("parent");
-const app=express();app.set("trust proxy",1);app.use(express.json());
+const app=express();app.set("trust proxy",1);app.use(express.json({limit:"5mb"}));
 const limiter=rateLimit({windowMs:15*60*1000,max:20,message:{error:"Too many attempts. Try again later."}});
 
 app.post("/api/admin/login",limiter,(q,r)=>{
@@ -76,6 +92,15 @@ app.get("/api/library/:id/file",P,(q,r)=>{if(!list().includes(q.params.id))retur
 const HTML=`<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0f172a">
+<meta name="application-name" content="Birati Chess">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Birati Chess">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="icon" type="image/png" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/icon-192.png">
 <title>Birati Chess Academy™ - Parent Portal & Management System</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
@@ -145,12 +170,14 @@ function vStudents(){
  <div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="text-left text-gray-500 border-b"><th class="p-2">Student</th><th>Code</th><th>Fee</th><th>Status</th><th></th></tr></thead><tbody>
  \${DB.students.map(s=>\`<tr class="border-b"><td class="p-2 font-medium">\${s.name}<div class="text-xs text-gray-400">\${s.course}</div></td><td><code>\${s.code}</code></td><td>₹\${s.fee}</td>
  <td><button data-tg="\${s.id}" class="px-3 py-1 rounded-full text-xs font-semibold \${s.active?"bg-green-100 text-green-700":"bg-gray-200 text-gray-600"}">\${s.active?"● Active":"○ Inactive"}</button></td>
- <td><button data-pr="\${s.id}" class="text-blue-700 text-xs mr-2">+Progress</button><button data-rg="\${s.id}" class="text-gray-600 text-xs mr-2">New code</button><button data-del="\${s.id}" class="text-red-600 text-xs">Delete</button></td></tr>\`).join("")}</tbody></table></div>\`);
+ <td><button data-pr="\${s.id}" class="text-blue-700 text-xs mr-2">+Progress</button><button data-rg="\${s.id}" class="text-gray-600 text-xs mr-2">New code</button><button data-del="\${s.id}" class="text-red-600 text-xs">Delete</button></td></tr>\`).join("")}</tbody></table></div><div class="mt-4 pt-3 border-t flex flex-wrap gap-2 items-center text-sm"><button id="bk" class="px-3 py-1 rounded border">⬇ Download backup</button><label class="px-3 py-1 rounded border cursor-pointer">⬆ Restore backup<input id="rs" type="file" accept=".json" class="hidden"></label><span class="text-xs text-gray-400">Download a backup after adding students.</span></div>\`);
  document.querySelectorAll("[data-tg]").forEach(b=>b.onclick=async()=>{const s=ST(+b.dataset.tg);await api("PATCH","/api/admin/students/"+s.id,{active:!s.active});s.active=!s.active;vStudents()});
  document.querySelectorAll("[data-del]").forEach(b=>b.onclick=async()=>{if(confirm("Permanently delete this student account?")){await api("DELETE","/api/admin/students/"+b.dataset.del);DB.students=DB.students.filter(s=>s.id!==+b.dataset.del);vStudents()}});
  document.querySelectorAll("[data-rg]").forEach(b=>b.onclick=async()=>{const d=await api("POST","/api/admin/students/"+b.dataset.rg+"/code");await load();alert("New access code: "+d.code);vStudents()});
  document.querySelectorAll("[data-pr]").forEach(b=>b.onclick=async()=>{const v=prompt("Cumulative lessons, puzzles, rating (e.g. 28, 310, 1100)");if(!v)return;const[l,p,r]=v.split(",").map(Number);await api("POST","/api/admin/students/"+b.dataset.pr+"/progress",{lessons:l,puzzles:p,rating:r});await load();vStudents()});
  $("#add").onclick=async()=>{const n=$("#nn").value.trim();if(!n)return;const d=await api("POST","/api/admin/students",{name:n,fee:+$("#nf").value||1500});DB.students.push(d.student);alert("Access code for "+n+":\\n\\n"+d.student.code+"\\n\\nShare this with the parent.");vStudents()};
+ $("#bk").onclick=async()=>{const r=await fetch("/api/admin/backup",{headers:{Authorization:"Bearer "+TOKEN}});const u=URL.createObjectURL(await r.blob()),a=document.createElement("a");a.href=u;a.download="academy-backup-"+new Date().toISOString().slice(0,10)+".json";a.click();URL.revokeObjectURL(u)};
+ $("#rs").onchange=async e=>{const f=e.target.files[0];if(!f||!confirm("Replace ALL current students with this backup?"))return;try{const d=await api("POST","/api/admin/restore",JSON.parse(await f.text()));await load();alert("Restored "+d.count+" students.");vStudents()}catch(x){alert("Restore failed: "+x.message)}};
 }
 function vAdminFees(){
  $("#v").innerHTML=card(\`<h2 class="font-semibold mb-3">Assign custom monthly fee</h2>\${DB.students.map(s=>\`<div class="flex items-center gap-3 py-2 border-b"><span class="flex-1">\${s.name} <span class="text-xs text-gray-400">\${s.course}</span></span>₹<input data-f="\${s.id}" type="number" value="\${s.fee}" class="border rounded p-1 w-28"></div>\`).join("")}<button id="sf" class="bgold px-4 py-2 rounded font-semibold mt-4">Save fees</button>\`);
@@ -215,8 +242,44 @@ function vFees(){
  $("#vp").onchange=e=>{vi=+e.target.value;up()};up();
 }
 login();
-</script></body></html>
+</script>
+<script>if("serviceWorker"in navigator)addEventListener("load",()=>navigator.serviceWorker.register("/sw.js").catch(()=>{}))</script></body></html>
 `;
+
+/* ---------- PWA: manifest, service worker, generated icons ---------- */
+const MANIFEST={id:"/",name:"Birati Chess Academy",short_name:"Birati Chess",description:"Birati Chess Academy™ Parent Portal & Management System",
+ start_url:"/",scope:"/",display:"standalone",orientation:"portrait-primary",theme_color:"#0f172a",background_color:"#0f172a",lang:"en",categories:["education"],
+ icons:[192,512].flatMap(s=>["any","maskable"].map(p=>({src:`/icon-${s}.png`,sizes:`${s}x${s}`,type:"image/png",purpose:p})))};
+const SW=`const V="bca-v1",SHELL=["/","/manifest.json","/icon-192.png"];
+self.addEventListener("install",e=>{e.waitUntil(caches.open(V).then(c=>c.addAll(SHELL)).then(()=>self.skipWaiting()))});
+self.addEventListener("activate",e=>{e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!==V).map(x=>caches.delete(x)))).then(()=>self.clients.claim()))});
+self.addEventListener("fetch",e=>{const r=e.request,u=new URL(r.url);
+ if(r.method!=="GET"||u.origin!==location.origin||u.pathname.startsWith("/api/"))return; // never cache private data, PDFs or API calls
+ if(r.mode==="navigate"){e.respondWith(fetch(r).then(x=>{if(u.pathname==="/"){const c=x.clone();caches.open(V).then(k=>k.put("/",c))}return x}).catch(()=>caches.match("/")));return}
+ e.respondWith(caches.match(r).then(h=>h||fetch(r)))});`;
+// tiny pure-Node PNG encoder: navy tile with a gold pawn (kept inside the maskable safe zone)
+const zlib=require("zlib"),crcT=(()=>{const t=[];for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c>>>0}return t})();
+const crc32=b=>{let c=~0;for(const x of b)c=crcT[(c^x)&255]^(c>>>8);return~c>>>0};
+const chunk=(t,d)=>{const l=Buffer.alloc(4),c=Buffer.alloc(4),td=Buffer.concat([Buffer.from(t),d]);l.writeUInt32BE(d.length);c.writeUInt32BE(crc32(td));return Buffer.concat([l,td,c])};
+const pawn=(X,Y)=>{const dx=Math.abs(X-256);
+ return dx*dx+(Y-185)**2<56**2||(Y>=236&&Y<=254&&dx<52)||(Y>254&&Y<=352&&dx<28+(Y-254)*.36)||(Y>352&&Y<=388&&dx<88)};
+function makePng(n){const bg=[15,23,42],fg=[245,166,35],row=n*3+1,raw=Buffer.alloc(row*n),u=512/n;
+ for(let y=0;y<n;y++){raw[y*row]=0;for(let x=0;x<n;x++){let a=0;
+  for(let i=0;i<2;i++)for(let j=0;j<2;j++)if(pawn((x+i/2+.25)*u,(y+j/2+.25)*u))a++;a/=4;
+  for(let k=0;k<3;k++)raw[y*row+1+x*3+k]=Math.round(bg[k]+(fg[k]-bg[k])*a)}}
+ const h=Buffer.alloc(13);h.writeUInt32BE(n,0);h.writeUInt32BE(n,4);h[8]=8;h[9]=2;
+ return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]),chunk("IHDR",h),chunk("IDAT",zlib.deflateSync(raw)),chunk("IEND",Buffer.alloc(0))])}
+const icons={};
+app.get("/manifest.json",(q,r)=>r.type("application/manifest+json").set("Cache-Control","no-cache").send(JSON.stringify(MANIFEST)));
+app.get("/sw.js",(q,r)=>r.type("application/javascript").set({"Cache-Control":"no-cache","Service-Worker-Allowed":"/"}).send(SW));
+app.get(["/icon-192.png","/icon-512.png"],(q,r)=>{const n=q.path.includes("512")?512:192;r.type("png").set("Cache-Control","public, max-age=86400").send(icons[n]||(icons[n]=makePng(n)))});
+
+/* ---------- admin backup / restore ---------- */
+app.get("/api/admin/backup",A,(q,r)=>{r.set("Content-Disposition",`attachment; filename="academy-backup.json"`);r.json(data)});
+app.post("/api/admin/restore",A,(q,r)=>{const st=q.body&&q.body.students;
+ if(!Array.isArray(st)||!st.every(s=>s&&Number.isInteger(s.id)&&s.name&&s.access_code&&Array.isArray(s.lessons)&&Array.isArray(s.puzzles)&&Array.isArray(s.ratings)))
+  return r.status(400).json({error:"Not a valid academy backup file"});
+ data.students=st;data.nextId=Math.max(1,...st.map(s=>s.id+1));persist();r.json({count:st.length})});
 
 /* ---------- homepage, health check & fallbacks ---------- */
 app.get("/healthz",(q,r)=>r.send("ok"));
@@ -225,4 +288,5 @@ app.get("/",(q,r)=>r.type("html").send(HTML));
 app.get("*",(q,r)=>r.redirect("/"));   // any other page → login screen
 app.use((e,q,r,n)=>{console.error(e);r.status(e.status||500).json({error:e.status===400?"Bad request":"Server error"})});
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`Birati Chess Academy running on port ${PORT}`));
+initDb().then(()=>app.listen(PORT,"0.0.0.0",()=>console.log(`Birati Chess Academy running on port ${PORT}`)))
+ .catch(e=>{console.error("Database start-up failed - refusing to start so no data is overwritten:",e.message);process.exit(1)});
