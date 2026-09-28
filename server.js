@@ -1,80 +1,68 @@
-/* Birati Chess Academy™ — single-file server: API + embedded web app. Run: npm install && npm start */
-const express=require("express"),bcrypt=require("bcryptjs"),jwt=require("jsonwebtoken"),
+/* Birati Chess Academy™ — single-file server: Express API + embedded web app + MongoDB (mongoose). */
+const express=require("express"),mongoose=require("mongoose"),bcrypt=require("bcryptjs"),jwt=require("jsonwebtoken"),
 rateLimit=require("express-rate-limit"),fs=require("fs"),path=require("path"),crypto=require("crypto");
-const {JWT_SECRET,ADMIN_EMAIL,ADMIN_PASSWORD,PORT=3000}=process.env;
-if(!JWT_SECRET||!ADMIN_EMAIL||!ADMIN_PASSWORD)throw new Error("Set JWT_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD (in .env locally, or Render's Environment tab)");
+const {DATABASE_URL,JWT_SECRET,ADMIN_EMAIL,ADMIN_PASSWORD}=process.env,PORT=process.env.PORT||3000;
+const missing=["DATABASE_URL","JWT_SECRET","ADMIN_EMAIL","ADMIN_PASSWORD"].filter(k=>!process.env[k]);
+if(missing.length)throw new Error("Missing environment variables: "+missing.join(", "));
 
-/* ---------- database: JSON document, kept in Postgres (DATABASE_URL) and/or a file (DB_PATH) ---------- */
-const DB_PATH=process.env.DB_PATH||path.join(__dirname,"academy.json"),BAK=DB_PATH+".bak";
-fs.mkdirSync(path.dirname(path.resolve(DB_PATH)),{recursive:true});
-let data=null,pool=null,chain=Promise.resolve();
-if(process.env.DATABASE_URL){const{Pool}=require("pg");pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.PGSSL==="off"?false:{rejectUnauthorized:false}})}
-const valid=d=>d&&Array.isArray(d.students)&&Array.isArray(d.admins);
-const readFile=f=>{try{const t=fs.readFileSync(f,"utf8").trim();if(!t)return null;const d=JSON.parse(t);return valid(d)?d:null}
- catch(e){if(e.code!=="ENOENT")console.warn("Could not read "+f+": "+e.message);return null}};
-// Every save: atomic write to the main file, then a second copy (.bak); also mirrored to Postgres if configured.
-const persist=()=>{
- try{const t=DB_PATH+".tmp";fs.writeFileSync(t,JSON.stringify(data));fs.renameSync(t,DB_PATH);fs.copyFileSync(DB_PATH,BAK)}catch(e){console.error("File save failed:",e.message)}
- if(pool){const snap=JSON.stringify(data);chain=chain.then(()=>pool.query("INSERT INTO kv(k,v) VALUES('db',$1) ON CONFLICT(k) DO UPDATE SET v=$1,updated=now()",[snap])).catch(e=>console.error("Postgres save failed:",e.message))}};
-// Startup NEVER wipes existing data: Postgres → main file → backup file → (only then) a brand-new empty database.
-async function initDb(){
- if(pool){await pool.query("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY,v JSONB NOT NULL,updated TIMESTAMPTZ DEFAULT now())");
-  const r=await pool.query("SELECT v FROM kv WHERE k='db'");   // if this throws we stop, rather than start empty and overwrite
-  if(r.rows[0]&&valid(r.rows[0].v)){data=r.rows[0].v;console.log("Loaded database from Postgres:",data.students.length,"students")}}
- if(!data){data=readFile(DB_PATH);if(data)console.log("Loaded",DB_PATH,"-",data.students.length,"students")}
- if(!data){data=readFile(BAK);if(data)console.warn("Main database missing/empty/corrupt - RESTORED from backup:",data.students.length,"students")}
- if(!data){data={admins:[],students:[],nextId:1};console.log("No existing database found - starting a new one")}
- data.nextId=Math.max(data.nextId||1,...data.students.map(s=>s.id+1));
- if(!data.admins.length)data.admins.push({email:ADMIN_EMAIL.toLowerCase(),password_hash:bcrypt.hashSync(ADMIN_PASSWORD,10)});
- persist();
- if(!pool&&process.env.RENDER)console.warn("WARNING: running on Render without DATABASE_URL - files are wiped on redeploy unless DB_PATH is on a Persistent Disk.")}
-
-const get=id=>data.students.find(s=>s.id===+id);
-const dto=(s,admin)=>({id:s.id,name:s.name,parent:s.parent,course:s.course,active:s.active,fee:s.fee,cc:s.cc,li:s.li,
+/* ---------- MongoDB models ---------- */
+const {Schema}=mongoose;
+const Student=mongoose.model("Student",new Schema({
+ id:{type:Number,unique:true,required:true},name:{type:String,required:true,trim:true},parent:{type:String,default:""},course:{type:String,default:"Beginner"},
+ access_code:{type:String,unique:true,required:true},active:{type:Boolean,default:true},fee:{type:Number,default:0},
+ cc:{type:String,default:""},li:{type:String,default:""},
+ lessons:{type:[Number],default:[0]},puzzles:{type:[Number],default:[0]},ratings:{type:[Number],default:[800]},
+ win:{type:Number,default:0},games:{type:Number,default:0}},{timestamps:true}));
+const Admin=mongoose.model("Admin",new Schema({email:{type:String,unique:true,required:true,lowercase:true,trim:true},password_hash:{type:String,required:true}}));
+const Counter=mongoose.model("Counter",new Schema({_id:String,seq:{type:Number,default:0}}));
+const nextId=async()=>(await Counter.findOneAndUpdate({_id:"student"},{$inc:{seq:1}},{new:true,upsert:true})).seq;
+const FIELDS=["id","name","parent","course","access_code","active","fee","cc","li","lessons","puzzles","ratings","win","games"];
+const pick=s=>Object.fromEntries(FIELDS.filter(k=>s[k]!==undefined).map(k=>[k,s[k]]));
+const dto=(s,admin)=>({id:s.id,name:s.name,parent:s.parent,course:s.course,active:s.active,fee:s.fee,cc:s.cc||"",li:s.li||"",
  lessons:s.lessons,puzzles:s.puzzles,ratings:s.ratings,ccR:s.ratings.at(-1),win:s.win,games:s.games,...(admin?{code:s.access_code}:{})});
-const newCode=()=>{let c;do{const h=crypto.randomBytes(4).toString("hex").toUpperCase();c=`BCA-${h.slice(0,4)}-${h.slice(4)}`}while(data.students.some(s=>s.access_code===c));return c};
+const newCode=async()=>{for(;;){const h=crypto.randomBytes(4).toString("hex").toUpperCase(),c=`BCA-${h.slice(0,4)}-${h.slice(4)}`;if(!(await Student.exists({access_code:c})))return c}};
 
-/* ---------- auth ---------- */
+/* ---------- express + auth ---------- */
+const app=express();app.set("trust proxy",1);app.use(express.json({limit:"5mb"}));
+const h=fn=>(q,r,n)=>Promise.resolve(fn(q,r,n)).catch(n);          // forward async errors to the error handler
 const sign=p=>jwt.sign(p,JWT_SECRET,{expiresIn:"12h"});
 // Checked on EVERY request: deactivating or deleting a student cuts access immediately.
-const auth=role=>(q,r,n)=>{try{
- const t=jwt.verify((q.headers.authorization||"").slice(7),JWT_SECRET);if(t.role!==role)throw 0;
- if(role==="parent"){const s=get(t.sid);if(!s||!s.active)return r.status(403).json({error:"Access revoked. Please contact the academy."});q.st=s}
- n()}catch{r.status(401).json({error:"Please log in again"})}};
+const auth=role=>h(async(q,r,n)=>{let t;
+ try{t=jwt.verify((q.headers.authorization||"").slice(7),JWT_SECRET);if(t.role!==role)throw 0}catch{return r.status(401).json({error:"Please log in again"})}
+ if(role==="parent"){const s=await Student.findOne({id:t.sid});if(!s||!s.active)return r.status(403).json({error:"Access revoked. Please contact the academy."});q.st=s}
+ n()});
 const A=auth("admin"),P=auth("parent");
-const app=express();app.set("trust proxy",1);app.use(express.json({limit:"5mb"}));
 const limiter=rateLimit({windowMs:15*60*1000,max:20,message:{error:"Too many attempts. Try again later."}});
 
-app.post("/api/admin/login",limiter,(q,r)=>{
- const a=data.admins.find(x=>x.email===String(q.body.email||"").trim().toLowerCase());
+app.post("/api/admin/login",limiter,h(async(q,r)=>{
+ const a=await Admin.findOne({email:String(q.body.email||"").trim().toLowerCase()});
  if(!a||!bcrypt.compareSync(String(q.body.password||""),a.password_hash))return r.status(401).json({error:"Invalid email or password"});
- r.json({token:sign({role:"admin"})})});
-app.post("/api/parent/login",limiter,(q,r)=>{
- const s=data.students.find(x=>x.access_code===String(q.body.code||"").trim().toUpperCase());
+ r.json({token:sign({role:"admin"})})}));
+app.post("/api/parent/login",limiter,h(async(q,r)=>{
+ const s=await Student.findOne({access_code:String(q.body.code||"").trim().toUpperCase()}).lean();
  if(!s)return r.status(401).json({error:"Invalid access code"});
  if(!s.active)return r.status(403).json({error:"This account is inactive. Please contact the academy."});
- r.json({token:sign({role:"parent",sid:s.id}),student:dto(s)})});
+ r.json({token:sign({role:"parent",sid:s.id}),student:dto(s)})}));
 
 /* ---------- admin ---------- */
-app.get("/api/admin/students",A,(q,r)=>r.json({students:data.students.map(s=>dto(s,true))}));
-app.post("/api/admin/students",A,(q,r)=>{const n=String(q.body.name||"").trim();if(!n)return r.status(400).json({error:"Name required"});
- const s={id:data.nextId++,name:n,parent:"",course:"Beginner",access_code:newCode(),active:true,fee:+q.body.fee||0,cc:"",li:"",
-  lessons:[0],puzzles:[0],ratings:[800],win:0,games:0,created_at:new Date().toISOString()};
- data.students.push(s);persist();r.json({student:dto(s,true)})});
-app.patch("/api/admin/students/:id",A,(q,r)=>{const s=get(q.params.id);if(!s)return r.sendStatus(404);
- if(q.body.active!==undefined)s.active=!!q.body.active;
- if(q.body.fee!==undefined)s.fee=+q.body.fee||0;persist();r.json({ok:1})});
-app.delete("/api/admin/students/:id",A,(q,r)=>{data.students=data.students.filter(s=>s.id!==+q.params.id);persist();r.json({ok:1})});
-app.post("/api/admin/students/:id/code",A,(q,r)=>{const s=get(q.params.id);if(!s)return r.sendStatus(404);s.access_code=newCode();persist();r.json({code:s.access_code})});
-app.post("/api/admin/students/:id/progress",A,(q,r)=>{const s=get(q.params.id);if(!s)return r.sendStatus(404);
+app.get("/api/admin/students",A,h(async(q,r)=>r.json({students:(await Student.find().sort({id:1}).lean()).map(s=>dto(s,true))})));
+app.post("/api/admin/students",A,h(async(q,r)=>{const n=String(q.body.name||"").trim();if(!n)return r.status(400).json({error:"Name required"});
+ const s=await Student.create({id:await nextId(),name:n,fee:+q.body.fee||0,access_code:await newCode()});r.json({student:dto(s.toObject(),true)})}));
+app.patch("/api/admin/students/:id",A,h(async(q,r)=>{const u={};
+ if(q.body.active!==undefined)u.active=!!q.body.active;if(q.body.fee!==undefined)u.fee=+q.body.fee||0;
+ if(!(await Student.findOneAndUpdate({id:+q.params.id},u)))return r.sendStatus(404);r.json({ok:1})}));
+app.delete("/api/admin/students/:id",A,h(async(q,r)=>{await Student.deleteOne({id:+q.params.id});r.json({ok:1})}));
+app.post("/api/admin/students/:id/code",A,h(async(q,r)=>{const s=await Student.findOne({id:+q.params.id});if(!s)return r.sendStatus(404);
+ s.access_code=await newCode();await s.save();r.json({code:s.access_code})}));
+app.post("/api/admin/students/:id/progress",A,h(async(q,r)=>{const s=await Student.findOne({id:+q.params.id});if(!s)return r.sendStatus(404);
  const add=(a,v)=>[...a,+v||0].slice(-12);
- s.lessons=add(s.lessons,q.body.lessons);s.puzzles=add(s.puzzles,q.body.puzzles);s.ratings=add(s.ratings,q.body.rating);persist();r.json({ok:1})});
+ s.lessons=add(s.lessons,q.body.lessons);s.puzzles=add(s.puzzles,q.body.puzzles);s.ratings=add(s.ratings,q.body.rating);await s.save();r.json({ok:1})}));
 
 /* ---------- parent ---------- */
-app.get("/api/parent/me",P,(q,r)=>r.json({student:dto(q.st)}));
-app.patch("/api/parent/usernames",P,(q,r)=>{const ok=v=>/^[A-Za-z0-9_-]{0,30}$/.test(v||"");
+app.get("/api/parent/me",P,(q,r)=>r.json({student:dto(q.st.toObject())}));
+app.patch("/api/parent/usernames",P,h(async(q,r)=>{const ok=v=>/^[A-Za-z0-9_-]{0,30}$/.test(v||"");
  if(!ok(q.body.cc)||!ok(q.body.li))return r.status(400).json({error:"Invalid username"});
- q.st.cc=q.body.cc||"";q.st.li=q.body.li||"";persist();r.json({ok:1})});
+ q.st.cc=q.body.cc||"";q.st.li=q.body.li||"";await q.st.save();r.json({ok:1})}));
 app.get("/api/parent/ratings",P,async(q,r)=>{const o={},s=q.st;
  try{if(s.cc){const d=await(await fetch(`https://api.chess.com/pub/player/${s.cc}/stats`,{headers:{"User-Agent":"BiratiChessAcademy"}})).json();
   const b=d.chess_rapid||d.chess_blitz,c=b.record,t=c.win+c.loss+c.draw;o.chesscom=[b.last.rating,Math.round(c.win/t*100)+"%",t]}}catch{}
@@ -275,18 +263,34 @@ app.get("/sw.js",(q,r)=>r.type("application/javascript").set({"Cache-Control":"n
 app.get(["/icon-192.png","/icon-512.png"],(q,r)=>{const n=q.path.includes("512")?512:192;r.type("png").set("Cache-Control","public, max-age=86400").send(icons[n]||(icons[n]=makePng(n)))});
 
 /* ---------- admin backup / restore ---------- */
-app.get("/api/admin/backup",A,(q,r)=>{r.set("Content-Disposition",`attachment; filename="academy-backup.json"`);r.json(data)});
-app.post("/api/admin/restore",A,(q,r)=>{const st=q.body&&q.body.students;
- if(!Array.isArray(st)||!st.every(s=>s&&Number.isInteger(s.id)&&s.name&&s.access_code&&Array.isArray(s.lessons)&&Array.isArray(s.puzzles)&&Array.isArray(s.ratings)))
-  return r.status(400).json({error:"Not a valid academy backup file"});
- data.students=st;data.nextId=Math.max(1,...st.map(s=>s.id+1));persist();r.json({count:st.length})});
+app.get("/api/admin/backup",A,h(async(q,r)=>{r.set("Content-Disposition",'attachment; filename="academy-backup.json"');
+ r.json({students:(await Student.find().sort({id:1}).lean()).map(pick)})}));
+app.post("/api/admin/restore",A,h(async(q,r)=>{const st=q.body&&q.body.students;
+ const ok=Array.isArray(st)&&st.every(s=>s&&Number.isInteger(s.id)&&s.name&&s.access_code&&Array.isArray(s.lessons)&&Array.isArray(s.puzzles)&&Array.isArray(s.ratings))
+  &&new Set(st.map(s=>s.id)).size===st.length&&new Set(st.map(s=>s.access_code)).size===st.length;
+ if(!ok)return r.status(400).json({error:"Not a valid academy backup file"});
+ await Student.deleteMany({});if(st.length)await Student.insertMany(st.map(pick));
+ await Counter.findOneAndUpdate({_id:"student"},{seq:Math.max(0,...st.map(s=>s.id))},{upsert:true});r.json({count:st.length})}));
 
 /* ---------- homepage, health check & fallbacks ---------- */
-app.get("/healthz",(q,r)=>r.send("ok"));
+app.get("/healthz",(q,r)=>mongoose.connection.readyState===1?r.send("ok"):r.status(503).send("database not connected"));
 app.use("/api",(q,r)=>r.status(404).json({error:"Not found"}));
 app.get("/",(q,r)=>r.type("html").send(HTML));
+app.use(express.static(path.join(__dirname,"public")));   // optional: any extra static files in ./public
 app.get("*",(q,r)=>r.redirect("/"));   // any other page → login screen
 app.use((e,q,r,n)=>{console.error(e);r.status(e.status||500).json({error:e.status===400?"Bad request":"Server error"})});
 
-initDb().then(()=>app.listen(PORT,"0.0.0.0",()=>console.log(`Birati Chess Academy running on port ${PORT}`)))
- .catch(e=>{console.error("Database start-up failed - refusing to start so no data is overwritten:",e.message);process.exit(1)});
+
+/* ---------- start: connect to MongoDB first, then listen ---------- */
+async function seed(){
+ if(!(await Admin.exists({})))await Admin.create({email:ADMIN_EMAIL,password_hash:bcrypt.hashSync(ADMIN_PASSWORD,10)});
+ // one-time import of a legacy academy.json from the old file-based version (only when the students collection is empty)
+ const legacy=process.env.DB_PATH||path.join(__dirname,"academy.json");
+ if(!(await Student.exists({}))&&fs.existsSync(legacy)){try{const d=JSON.parse(fs.readFileSync(legacy,"utf8"));
+  if(Array.isArray(d.students)&&d.students.length){await Student.insertMany(d.students.map(pick));
+   await Counter.findOneAndUpdate({_id:"student"},{seq:Math.max(...d.students.map(s=>s.id))},{upsert:true});console.log("Imported",d.students.length,"students from",legacy)}}
+  catch(e){console.warn("Legacy import skipped:",e.message)}}}
+mongoose.connect(DATABASE_URL,{serverSelectionTimeoutMS:15000})
+ .then(async()=>{console.log("✅ MongoDB connected successfully");await seed();
+  app.listen(PORT,"0.0.0.0",()=>console.log(`Birati Chess Academy running on port ${PORT}`))})
+ .catch(err=>{console.error("❌ MongoDB connection failed:",err.message);process.exit(1)});
