@@ -1,0 +1,4 @@
+node_modules
+.env
+academy.json
+academy.json.tmp
